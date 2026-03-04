@@ -4,15 +4,18 @@ import android.annotation.SuppressLint
 import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ActivityInfo
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
 import android.view.KeyEvent
 import android.view.WindowManager
-import android.webkit.*
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.EditText
-import android.widget.ImageView
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
@@ -25,14 +28,16 @@ import java.net.URL
 class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
+    private lateinit var root: FrameLayout
+
     private val prefs by lazy { getSharedPreferences("kiosk_prefs", Context.MODE_PRIVATE) }
 
     companion object {
         private const val PREF_URL = "last_url"
         private const val DEFAULT_URL = "https://example.com"
 
-        // mögliche Werte: auto, landscape, portrait, reverse_landscape, reverse_portrait
-        private const val PREF_ORIENTATION = "orientation_mode"
+        // Rotation in Grad: -90, 0, 90, 180
+        private const val PREF_ROTATION_DEG = "rotation_deg"
 
         // GitHub latest release API
         private const val GITHUB_LATEST_API =
@@ -50,13 +55,11 @@ class MainActivity : AppCompatActivity() {
         // Bildschirm wach halten (verhindert Standby, solange App im Vordergrund ist)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Gespeicherte Orientierung anwenden
-        applySavedOrientation()
-
         setContentView(R.layout.activity_main)
-
+        root = findViewById(R.id.root)
         webView = findViewById(R.id.webView)
 
+        // WebView Setup
         val s = webView.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
@@ -73,9 +76,13 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // gespeicherte Rotation anwenden
+        applySavedRotation()
+
+        // URL laden oder beim ersten Start Dialog öffnen
         val saved = prefs.getString(PREF_URL, null)
         if (saved.isNullOrBlank()) {
-            askForUrlAndLoad(initial = true)
+            showConfigDialog(initial = true)
         } else {
             loadUrl(saved)
         }
@@ -96,37 +103,112 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl(normalized)
     }
 
-    private fun askForUrlAndLoad(initial: Boolean) {
-        val input = EditText(this).apply {
+    // -------------------------
+    // Options / Config Dialog
+    // -------------------------
+    private fun showConfigDialog(initial: Boolean) {
+        val urlInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setText(prefs.getString(PREF_URL, DEFAULT_URL) ?: DEFAULT_URL)
             setSelection(text.length)
+            hint = "https://dein-link.de"
+        }
+
+        val rotationLabels = arrayOf("0°", "90°", "180°", "-90°")
+        val rotationValues = intArrayOf(0, 90, 180, -90)
+
+        val currentRotation = prefs.getInt(PREF_ROTATION_DEG, 0)
+        val checkedIndex = rotationValues.indexOf(currentRotation).let { if (it >= 0) it else 0 }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+
+            addView(TextView(this@MainActivity).apply {
+                text = "Link (URL)"
+                textSize = 16f
+            })
+            addView(urlInput)
+
+            addView(TextView(this@MainActivity).apply {
+                text = "\nMonitor-Rotation"
+                textSize = 16f
+            })
         }
 
         AlertDialog.Builder(this)
-            .setTitle(if (initial) "URL eingeben" else "URL ändern")
-            .setMessage("Welche Webseite soll angezeigt werden?")
-            .setView(input)
-            .setCancelable(false)
-            .setPositiveButton("OK") { _, _ ->
-                val url = input.text?.toString().orEmpty()
-                if (url.isBlank()) {
-                    askForUrlAndLoad(initial)
-                } else {
-                    loadUrl(url)
+            .setTitle(if (initial) "Einrichtung" else "Einstellungen")
+            .setView(container)
+            .setSingleChoiceItems(rotationLabels, checkedIndex, null)
+            .setCancelable(!initial)
+            .setPositiveButton("OK") { dialog, _ ->
+                val urlRaw = urlInput.text?.toString().orEmpty().trim()
+
+                val listView = (dialog as AlertDialog).listView
+                val pickedIndex = listView.checkedItemPosition.takeIf { it >= 0 } ?: checkedIndex
+                val deg = rotationValues[pickedIndex]
+
+                if (urlRaw.isBlank()) {
+                    showConfigDialog(initial)
+                    return@setPositiveButton
                 }
+
+                val normalized = normalizeUrl(urlRaw)
+
+                prefs.edit()
+                    .putString(PREF_URL, normalized)
+                    .putInt(PREF_ROTATION_DEG, deg)
+                    .apply()
+
+                applyRotation(deg)
+                loadUrl(normalized)
             }
-            .setNegativeButton(if (initial) "Abbrechen" else "Zurück") { _, _ ->
+            .setNegativeButton(if (initial) "Abbrechen" else "Schließen") { _, _ ->
                 if (initial) loadUrl(DEFAULT_URL)
+            }
+            .setNeutralButton("Updates") { _, _ ->
+                checkForUpdate(silentIfNone = false)
             }
             .show()
     }
 
+    // -------------------------
+    // Rotation (View-Rotation)
+    // -------------------------
+    private fun applySavedRotation() {
+        val deg = prefs.getInt(PREF_ROTATION_DEG, 0)
+        applyRotation(deg)
+    }
+
+    private fun applyRotation(deg: Int) {
+        // erst nach Layout, damit Maße stimmen
+        root.post {
+            val dm = resources.displayMetrics
+            val screenW = dm.widthPixels
+            val screenH = dm.heightPixels
+
+            val lp = root.layoutParams
+
+            // bei 90/-90: Maße tauschen, dann rotieren => füllt den Screen korrekt
+            if (deg == 90 || deg == -90) {
+                lp.width = screenH
+                lp.height = screenW
+            } else {
+                lp.width = screenW
+                lp.height = screenH
+            }
+
+            root.layoutParams = lp
+            root.pivotX = lp.width / 2f
+            root.pivotY = lp.height / 2f
+            root.rotation = deg.toFloat()
+        }
+    }
+
     // Fernbedienung:
     // - Zurück = WebView zurück
-    // - Menü/Options/Settings/TopMenu/ContextMenu = Options-Menü
+    // - Menü/Options/Settings/TopMenu/ContextMenu = Config-Dialog
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             if (::webView.isInitialized && webView.canGoBack()) {
                 webView.goBack()
@@ -141,112 +223,25 @@ class MainActivity : AppCompatActivity() {
             keyCode == KeyEvent.KEYCODE_MEDIA_TOP_MENU ||
             keyCode == KeyEvent.KEYCODE_MEDIA_CONTEXT_MENU
         ) {
-            showOptionsMenu()
+            showConfigDialog(initial = false)
             return true
         }
 
         return super.onKeyDown(keyCode, event)
     }
 
-    // Fallback: langer Druck auf OK/Select öffnet Menü (damit es immer erreichbar ist)
+    // Fallback: langer Druck auf OK/Select öffnet Dialog (damit es immer erreichbar ist)
     override fun onKeyLongPress(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
-            showOptionsMenu()
+            showConfigDialog(initial = false)
             return true
         }
         return super.onKeyLongPress(keyCode, event)
     }
 
-    private fun showOptionsMenu() {
-        val items = arrayOf(
-            "URL ändern",
-            "Rotation / Ausrichtung",
-            "Nach Updates suchen"
-        )
-
-        AlertDialog.Builder(this)
-            .setCustomTitle(buildMenuHeaderView())
-            .setItems(items) { _, which ->
-                when (which) {
-                    0 -> askForUrlAndLoad(initial = false)
-                    1 -> showOrientationMenu()
-                    2 -> checkForUpdate(silentIfNone = false)
-                }
-            }
-            .setNegativeButton("Schließen", null)
-            .show()
-    }
-
-    private fun buildMenuHeaderView(): LinearLayout {
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(32, 24, 32, 8)
-        }
-
-        val logo = ImageView(this).apply {
-            // Logo muss unter app/src/main/res/drawable/tendance_logo.png liegen
-            setImageResource(R.drawable.tendance_logo)
-            layoutParams = LinearLayout.LayoutParams(120, 120).apply { marginEnd = 24 }
-            scaleType = ImageView.ScaleType.FIT_CENTER
-        }
-
-        val title = TextView(this).apply {
-            text = "FireKiosk – Optionen"
-            textSize = 20f
-            setPadding(0, 30, 0, 0)
-        }
-
-        container.addView(logo)
-        container.addView(title)
-        return container
-    }
-
-    private fun showOrientationMenu() {
-        val labels = arrayOf(
-            "Auto (Standard)",
-            "Landscape",
-            "Portrait",
-            "Reverse Landscape",
-            "Reverse Portrait"
-        )
-
-        val values = arrayOf(
-            "auto",
-            "landscape",
-            "portrait",
-            "reverse_landscape",
-            "reverse_portrait"
-        )
-
-        val current = prefs.getString(PREF_ORIENTATION, "auto") ?: "auto"
-        val checkedIndex = values.indexOf(current).let { if (it >= 0) it else 0 }
-
-        AlertDialog.Builder(this)
-            .setTitle("Rotation / Ausrichtung")
-            .setSingleChoiceItems(labels, checkedIndex) { dialog, which ->
-                prefs.edit().putString(PREF_ORIENTATION, values[which]).apply()
-                applySavedOrientation()
-                dialog.dismiss()
-                recreate()
-            }
-            .setNegativeButton("Abbrechen", null)
-            .show()
-    }
-
-    private fun applySavedOrientation() {
-        when (prefs.getString(PREF_ORIENTATION, "auto")) {
-            "landscape" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            "portrait" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
-            "reverse_landscape" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
-            "reverse_portrait" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
-            else -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
-        }
-    }
-
     // -------------------------
     // Auto Update (GitHub latest)
     // -------------------------
-
     private fun checkForUpdate(silentIfNone: Boolean) {
         Thread {
             try {
@@ -278,7 +273,7 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         AlertDialog.Builder(this)
                             .setTitle("Update-Check fehlgeschlagen")
-                            .setMessage("Konnte nicht prüfen. Internet verfügbar?\n\n${e.message ?: ""}")
+                            .setMessage("Konnte nicht prüfen.\nInternet verfügbar?\n\n${e.message ?: ""}")
                             .setPositiveButton("OK", null)
                             .show()
                     }
@@ -308,9 +303,7 @@ class MainActivity : AppCompatActivity() {
         AlertDialog.Builder(this)
             .setTitle("Update verfügbar")
             .setMessage("Neue Version verfügbar: $tag\n\nJetzt herunterladen und installieren?")
-            .setPositiveButton("Installieren") { _, _ ->
-                downloadAndInstallApk()
-            }
+            .setPositiveButton("Installieren") { _, _ -> downloadAndInstallApk() }
             .setNegativeButton("Später", null)
             .show()
     }
